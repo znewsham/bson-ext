@@ -1,5 +1,5 @@
 {
-  "name": "bson-ext",
+  "name": "bson-ext-dev",
   "description": "The C++ bson parser for the node.js mongodb driver.",
   "keywords": [
     "mongodb",
@@ -7,8 +7,8 @@
     "parser"
   ],
   "version": "4.0.0",
-  "author": { 
-    "name": "The MongoDB NodeJS Team", 
+  "author": {
+    "name": "The MongoDB NodeJS Team",
     "email": "dbx-node@mongodb.com"
   },
   "contributors": [],
@@ -39,6 +39,7 @@
   },
   "scripts": {
     "format": "clang-format -i --style=file --glob=\"src/*.{h,cc}\"",
+    "build-debug": "node-gyp build --debug",
     "install": "prebuild-install || node-gyp rebuild",
     "rebuild": "prebuild --compile",
     "prebuild": "prebuild  --strip --verbose --all",
