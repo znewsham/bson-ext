@@ -1,5 +1,5 @@
 //===========================================================================
-
+#include <iostream>
 #include <cstdlib>
 #include <cstring>
 #include <stdarg.h>
@@ -35,6 +35,8 @@
 
 #include "bson.h"
 #include "utf8decoder.h"
+
+static int count = 0;
 
 void die(const char *message) {
   if (errno) {
@@ -606,11 +608,11 @@ void BSONSerializer<T>::SerializeValue(void *typeLocation,
 BSONDeserializer::BSONDeserializer(BSON *aBson, char *data, size_t length,
                                    bool bsonRegExp, bool promoteLongs,
                                    bool promoteBuffers, bool promoteValues,
-                                   Local<Object> fieldsAsRaw)
+                                   Local<Object> fieldsAsRaw, bool useDataProperty, bool useConstructors, bool useClone)
     : bson(aBson), pStart(data), p(data), pEnd(data + length - 1),
       bsonRegExp(bsonRegExp), promoteLongs(promoteLongs),
       promoteBuffers(promoteBuffers), promoteValues(promoteValues),
-      fieldsAsRaw(fieldsAsRaw) {
+      fieldsAsRaw(fieldsAsRaw), useDataProperty(useDataProperty), useConstructors(useConstructors), useClone(useClone) {
   if (*pEnd != '\0')
     ThrowAllocatedStringException(64, "Missing end of document marker '\\0'");
 }
@@ -619,12 +621,12 @@ BSONDeserializer::BSONDeserializer(BSONDeserializer &parentSerializer,
                                    size_t length, bool bsonRegExp,
                                    bool promoteLongs, bool promoteBuffers,
                                    bool promoteValues,
-                                   Local<Object> fieldsAsRaw)
+                                   Local<Object> fieldsAsRaw, bool useDataProperty, bool useConstructors, bool useClone)
     : bson(parentSerializer.bson), pStart(parentSerializer.p),
       p(parentSerializer.p), pEnd(parentSerializer.p + length - 1),
       bsonRegExp(bsonRegExp), promoteLongs(promoteLongs),
       promoteBuffers(promoteBuffers), promoteValues(promoteValues),
-      fieldsAsRaw(fieldsAsRaw) {
+      fieldsAsRaw(fieldsAsRaw), useDataProperty(useDataProperty), useConstructors(useConstructors), useClone(useClone) {
   parentSerializer.p += length;
   if (pEnd > parentSerializer.pEnd)
     ThrowAllocatedStringException(64, "Child document exceeds parent's bounds");
@@ -753,7 +755,7 @@ Local<Value> BSONDeserializer::DeserializeDocument(bool raw) {
 
   BSONDeserializer documentDeserializer(*this, length - 4, bsonRegExp,
                                         promoteLongs, promoteBuffers,
-                                        promoteValues, fieldsAsRaw);
+                                        promoteValues, fieldsAsRaw, useDataProperty, useConstructors, useClone);
   // Serialize the document
   Local<Value> value = documentDeserializer.DeserializeDocumentInternal();
 
@@ -765,11 +767,47 @@ Local<Value> BSONDeserializer::DeserializeDocument(bool raw) {
   return value;
 }
 
+Local<Object> BSONDeserializer::GetReturnObject(int propertyCount, bool &useDataProperty) {
+  v8::Isolate *isolate = v8::Isolate::GetCurrent();
+  Local<Object> returnObject;
+  if (!useConstructors || propertyCount < 4) {
+    useDataProperty = false;
+    return Unmaybe(v8::Object::New(v8::Isolate::GetCurrent()));
+  }
+  // TODO: make this number a constant and assert that the constructors, if passed in, are this length.
+  int maxLength = 500;//bson->objectConstructors->Length();
+  if (useClone) {
+    Local<Object> clones = Local<Object>::Cast(Unmaybe(Nan::Get(bson->objectClones, std::min(maxLength - 1, propertyCount))));
+    returnObject = Unmaybe(clones->Clone());
+  }
+  else {
+    Local<Function> constructor = Local<Function>::Cast(Unmaybe(Nan::Get(bson->objectConstructors, std::min(maxLength - 1, propertyCount))));
+    Nan::MaybeLocal<Object> obj = constructor->NewInstance(
+      v8::Isolate::GetCurrent()->GetCurrentContext()
+    );
+    returnObject = Unmaybe(obj);
+  }
+  return returnObject;
+}
+
 Local<Value> BSONDeserializer::DeserializeDocumentInternal() {
-  Local<Object> returnObject = Unmaybe(Nan::New<Object>());
+  v8::Isolate *isolate = v8::Isolate::GetCurrent();
+  int MAX_PROPERTIES = 0;
+  if (!useConstructors) {
+    MAX_PROPERTIES = 0;
+  }
+  Local<Object> returnObject;
+  Local<Value>* values = new Local<Value>[MAX_PROPERTIES];
+  Local<Value>* names = new Local<Value>[MAX_PROPERTIES];
+
+
   Local<String> propertyName;
   bool raw = false;
   bool hasDollar = false;
+  bool mustPopulate = true;
+  int startIndex = 0;
+  int index = startIndex;
+  bool useDataProperty = false;//this->useDataProperty;
 
   while (HasMoreData()) {
     BsonType type = (BsonType)ReadByte();
@@ -785,6 +823,7 @@ Local<Value> BSONDeserializer::DeserializeDocumentInternal() {
     if (type == BSON_TYPE_ARRAY &&
         !Nan::MaybeLocal<Object>(fieldsAsRaw).IsEmpty()) {
       // Get the object property names
+     
       Local<Array> propertyNames = Unmaybe(Nan::GetPropertyNames(fieldsAsRaw));
 
       // Length of the property
@@ -799,12 +838,60 @@ Local<Value> BSONDeserializer::DeserializeDocumentInternal() {
         }
       }
     }
-
-    // Deserialize the value
     const Local<Value> &value = DeserializeValue(type, raw);
-    Nan::Set(returnObject, name, value);
+    if (index < MAX_PROPERTIES) {
+      names[index] = name;
+      values[index] = value;
+      index++;
+    }
+    else {
+      if (mustPopulate) {
+        returnObject = GetReturnObject(index, useDataProperty);
+        if (useDataProperty != this->useDataProperty) {
+          isolate = NULL;
+        }
+        mustPopulate = false;
+        for (int i = startIndex; i < index; i++) {
+          if (useDataProperty) {
+            Local<v8::Name>* actualName2 = (Local<v8::Name>*)&names[i];
+            returnObject->CreateDataProperty(isolate->GetCurrentContext(), *actualName2, values[i]);
+          }
+          else {
+            Nan::Set(returnObject, names[i], values[i]);
+          }
+        }
+        delete[] names;
+        delete[] values;
+      }
+      if (useDataProperty) {
+        Local<v8::Name>* actualName2 = (Local<v8::Name>*)&name;
+        returnObject->CreateDataProperty(isolate->GetCurrentContext(), *actualName2, value);
+      }
+      else {
+         Nan::Set(returnObject, name, value);
+      }
+    }
   }
 
+  if (mustPopulate) {
+    returnObject = GetReturnObject(index, useDataProperty);
+    if (returnObject.IsEmpty()) {
+      ThrowAllocatedStringException(64, "Bad BSON Document: illegal Object");
+    }
+    for (int i = startIndex; i < index; i++) {
+      if (useDataProperty) {
+        Local<v8::Name>* actualName2 = (Local<v8::Name>*)&names[i];
+        returnObject->CreateDataProperty(isolate->GetCurrentContext(), *actualName2, values[i]);
+      }
+      else {
+        Nan::Set(returnObject, names[i], values[i]);
+      }
+    }
+    delete[] names;
+    delete[] values;
+    //Local<Object> o = Unmaybe(v8::Object::New(isolate));
+    //o->SetPrototype(isolate->GetCurrentContext(), returnObject);
+  }
   if (p != pEnd)
     ThrowAllocatedStringException(
         64, "Bad BSON Document: Serialize consumed unexpected number of bytes");
@@ -850,7 +937,6 @@ Local<Value> BSONDeserializer::DeserializeDocumentInternal() {
       return obj.ToLocalChecked();
     }
   }
-
   return returnObject;
 }
 
@@ -862,7 +948,7 @@ Local<Value> BSONDeserializer::DeserializeArray(bool raw) {
 
   BSONDeserializer documentDeserializer(*this, length - 4, bsonRegExp,
                                         promoteLongs, promoteBuffers,
-                                        promoteValues, fieldsAsRaw);
+                                        promoteValues, fieldsAsRaw, useDataProperty, useConstructors, useClone);
   return documentDeserializer.DeserializeArrayInternal(raw);
 }
 
@@ -1270,7 +1356,7 @@ void BSON::Initialize(v8::Local<v8::Object> target) {
                           SerializeWithBufferAndIndex);
   Nan::SetPrototypeMethod(t, "deserialize", BSONDeserialize);
   Nan::SetPrototypeMethod(t, "deserializeStream", BSONDeserializeStream);
-
+  Nan::SetPrototypeMethod(t, "setConstructors", BSONObjectConstructor);
   constructor_template.Reset(t);
 
   Nan::Set(target, NanStr("BSON"), Unmaybe(Nan::GetFunction(t)));
@@ -1461,9 +1547,31 @@ NAN_METHOD(BSON::New) {
 //------------------------------------------------------------------------------------------------
 //------------------------------------------------------------------------------------------------
 
+NAN_METHOD(BSON::BSONObjectConstructor) {
+  Nan::HandleScope scope;
+  v8::Isolate *isolate = v8::Isolate::GetCurrent();
+  Local<Array> constructors = Local<Array>::Cast(info[0]);
+  int constructorsLength = constructors->Length();
+  Local<Array> objects = Unmaybe(Array::New(isolate, constructorsLength));
+  for (int i = 0; i < constructorsLength; ++i) {
+    Local<Function> constructor = Local<Function>::Cast(Unmaybe(NanGet(constructors, i)));
+    
+    Nan::MaybeLocal<Object> obj = constructor->NewInstance(
+      isolate->GetCurrentContext()
+    );
+    // TODO: preLoadedIndex 
+    //Nan::Set(objects, Nan::New<Integer>(i), Unmaybe(obj));
+    objects->Set(isolate->GetCurrentContext(), (uint32_t)i, Unmaybe(obj));
+  }
+  BSON *bson = ObjectWrap::Unwrap<BSON>(info.This());
+  bson->objectConstructorsPers.Reset(constructors);
+  bson->objectClonesPers.Reset(objects);
+  
+  // Fail if the first argument is not a string or a buffer
+}
+
 NAN_METHOD(BSON::BSONDeserialize) {
   Nan::HandleScope scope;
-
   // Fail if the first argument is not a string or a buffer
   if (info.Length() > 1 && !info[0]->IsString() &&
       !node::Buffer::HasInstance(info[0]))
@@ -1474,18 +1582,46 @@ NAN_METHOD(BSON::BSONDeserialize) {
   bool promoteBuffers = false;
   bool bsonRegExp = false;
   bool promoteValues = true;
+  bool useDataProperty = false;
+  bool useConstructors = false;
+  bool useClone = false;
+  Local<Array> objectConstructors;
   Local<Object> fieldsAsRaw;
 
   // If we have an options object
   if (info.Length() == 2 && info[1]->IsObject()) {
     Local<Object> options = NanToObject(info[1]);
 
+    if (NanHas(options, "objectConstructors")) {
+      objectConstructors = Local<Array>::Cast(NanGet(options, "objectConstructors"));
+    }
     // Check if we have the promoteLongs variable
     if (NanHas(options, "promoteLongs")) {
       if (NanGet(options, "promoteLongs")->IsBoolean()) {
         promoteLongs = NanTo<bool>(NanGet(options, "promoteLongs"));
       } else {
         return Nan::ThrowError("promoteLongs argument must be a boolean");
+      }
+    }
+    if (NanHas(options, "useDataProperty")) {
+      if (NanGet(options, "useDataProperty")->IsBoolean()) {
+        useDataProperty = NanTo<bool>(NanGet(options, "useDataProperty"));
+      } else {
+        return Nan::ThrowError("useDataProperty argument must be a boolean");
+      }
+    }
+    if (NanHas(options, "useConstructors")) {
+      if (NanGet(options, "useConstructors")->IsBoolean()) {
+        useConstructors = NanTo<bool>(NanGet(options, "useConstructors"));
+      } else {
+        return Nan::ThrowError("useConstructors argument must be a boolean");
+      }
+    }
+    if (NanHas(options, "useClone")) {
+      if (NanGet(options, "useClone")->IsBoolean()) {
+        useClone = NanTo<bool>(NanGet(options, "useClone"));
+      } else {
+        return Nan::ThrowError("useClone argument must be a boolean");
       }
     }
 
@@ -1531,6 +1667,12 @@ NAN_METHOD(BSON::BSONDeserialize) {
 
   // Unpack the BSON parser instance
   BSON *bson = ObjectWrap::Unwrap<BSON>(info.This());
+  // bson->objectConstructors = objectConstructors;
+  
+  if (!bson->objectConstructorsPers.IsEmpty()) {
+    bson->objectConstructors = Nan::New(bson->objectConstructorsPers);
+    bson->objectClones = Nan::New(bson->objectClonesPers);
+  }
 
   // If we passed in a buffer, let's unpack it, otherwise let's unpack the
   // string
@@ -1551,7 +1693,7 @@ NAN_METHOD(BSON::BSONDeserialize) {
     try {
       BSONDeserializer deserializer(bson, data, length, bsonRegExp,
                                     promoteLongs, promoteBuffers, promoteValues,
-                                    fieldsAsRaw);
+                                    fieldsAsRaw, useDataProperty, useConstructors, useClone);
       info.GetReturnValue().Set(deserializer.DeserializeDocument(false));
     } catch (char *exception) {
       Local<String> error = NanStr(exception);
@@ -1574,7 +1716,7 @@ NAN_METHOD(BSON::BSONDeserialize) {
 
     try {
       BSONDeserializer deserializer(bson, data, len, bsonRegExp, promoteLongs,
-                                    promoteBuffers, promoteValues, fieldsAsRaw);
+                                    promoteBuffers, promoteValues, fieldsAsRaw, useDataProperty, useConstructors, useClone);
       // deserializer.promoteLongs = promoteLongs;
       Local<Value> result = deserializer.DeserializeDocument(false);
       free(data);
@@ -1876,6 +2018,9 @@ NAN_METHOD(BSON::BSONDeserializeStream) {
   bool promoteBuffers = false;
   bool bsonRegExp = false;
   bool promoteValues = true;
+  bool useDataProperty = false;
+  bool useConstructors = false;
+  bool useClone = false;
   Local<Object> fieldsAsRaw;
 
   // Check for the value promoteLongs in the options object
@@ -1926,6 +2071,27 @@ NAN_METHOD(BSON::BSONDeserializeStream) {
         return Nan::ThrowError("promoteValues argument must be a boolean");
       }
     }
+    if (NanHas(options, "useDataProperty")) {
+      if (NanGet(options, "useDataProperty")->IsBoolean()) {
+        useDataProperty = NanTo<bool>(NanGet(options, "useDataProperty"));
+      } else {
+        return Nan::ThrowError("useDataProperty argument must be a boolean");
+      }
+    }
+    if (NanHas(options, "useConstructors")) {
+      if (NanGet(options, "useConstructors")->IsBoolean()) {
+        useConstructors = NanTo<bool>(NanGet(options, "useConstructors"));
+      } else {
+        return Nan::ThrowError("useConstructors argument must be a boolean");
+      }
+    }
+    if (NanHas(options, "useClone")) {
+      if (NanGet(options, "useClone")->IsBoolean()) {
+        useClone = NanTo<bool>(NanGet(options, "useClone"));
+      } else {
+        return Nan::ThrowError("useClone argument must be a boolean");
+      }
+    }
   }
 
   // Unpack the BSON parser instance
@@ -1946,7 +2112,7 @@ NAN_METHOD(BSON::BSONDeserializeStream) {
 
   BSONDeserializer deserializer(bson, data + index, length - index, bsonRegExp,
                                 promoteLongs, promoteBuffers, promoteValues,
-                                fieldsAsRaw);
+                                fieldsAsRaw, useDataProperty, useConstructors, useClone);
   for (uint32_t i = 0; i < numberOfDocuments; i++) {
     try {
       Nan::Set(documents, i + resultIndex,

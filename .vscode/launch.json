@@ -1,0 +1,14 @@
+{
+    "version": "0.2.0",
+    "configurations": [{
+       "type": "lldb",
+       "request": "launch",
+       "name": "Launch Program",
+       "preLaunchTask": "npm: build-debug",
+       "program": "/home/zacknewsham/.nvm/versions/node/v16.0.0/bin/node",
+       "args": [
+          "--allow-natives-syntax",
+          "/home/zacknewsham/Sites/qualia/test-bosn.js"
+       ]
+    }]
+  }

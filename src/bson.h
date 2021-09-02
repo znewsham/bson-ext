@@ -38,12 +38,14 @@ using v8::RegExp;
 using v8::String;
 using v8::Uint32;
 using v8::Value;
+using v8::Name;
 
 const int preLoadedIndex = 10000;
 
 #define NanStr(x) (Unmaybe(Nan::New<String>(x)))
 #define NanHas(obj, key) (Nan::Has(obj, NanKey(key)).FromJust())
 #define NanGet(obj, key) (Unmaybe(Nan::Get(obj, NanKey(key))))
+#define NanSet(obj, key, value) (Nan::Set(obj, NanKey(key), value))
 #define NanEquals(a, b) (Unmaybe(Nan::Equals(a, b)))
 #define NanToString(obj) (Unmaybe(obj->ToString(Nan::GetCurrentContext())))
 #define NanToObject(obj) (Unmaybe(obj->ToObject(Nan::GetCurrentContext())))
@@ -132,12 +134,17 @@ public:
   BSON();
   ~BSON();
 
+  Local<Array> objectConstructors;
+  Local<Array> objectClones;
+  Persistent<Array> objectConstructorsPers;
+  Persistent<Array> objectClonesPers;
   static void Initialize(Local<Object> target);
   static NAN_METHOD(BSONDeserializeStream);
 
   // JS based objects
   static NAN_METHOD(BSONSerialize);
   static NAN_METHOD(BSONDeserialize);
+  static NAN_METHOD(BSONObjectConstructor);
 
   // Calculate size of function
   static NAN_METHOD(CalculateObjectSize);
@@ -213,6 +220,7 @@ private:
   Nan::Persistent<Function> maxKeyConstructor;
 
   Local<Object> GetSerializeObject(const Local<Value> &object);
+
 
   template <typename T> friend class BSONSerializer;
   friend class BSONDeserializer;
@@ -505,11 +513,10 @@ class BSONDeserializer {
 public:
   BSONDeserializer(BSON *aBson, char *data, size_t length, bool bsonRegExp,
                    bool promoteLongs, bool promoteBuffers, bool promoteValues,
-                   Local<Object> fieldsAsRaw);
+                   Local<Object> fieldsAsRaw, bool useDataProperty, bool useConstructors, bool useClone);
   BSONDeserializer(BSONDeserializer &parentSerializer, size_t length,
                    bool bsonRegExp, bool promoteLongs, bool promoteBuffers,
-                   bool promoteValues, Local<Object> fieldsAsRaw);
-
+                   bool promoteValues, Local<Object> fieldsAsRaw, bool useDataProperty, bool useConstructors, bool useClone);
   Local<Value> DeserializeDocument(bool raw);
 
   bool HasMoreData() const { return p < pEnd; }
@@ -610,13 +617,17 @@ private:
   Local<Value> DeserializeValue(BsonType type, bool raw);
   Local<Value> DeserializeDocumentInternal();
   Local<Value> DeserializeArrayInternal(bool raw);
-
+  bool usedConstructor = false;
+  Local<Object> GetReturnObject(int propertyCount, bool &useDataProperty);
   BSON *bson;
   char *const pStart;
   char *p;
   char *const pEnd;
   bool bsonRegExp;
   bool promoteLongs;
+  bool useConstructors;
+  bool useClone;
+  bool useDataProperty;
   bool promoteBuffers;
   bool promoteValues;
   Local<Object> fieldsAsRaw;
